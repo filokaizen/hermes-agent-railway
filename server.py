@@ -478,8 +478,12 @@ class Gateway:
             model = env.get("LLM_MODEL", "")
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
-            # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            write_config_yaml(read_env(ENV_FILE))
+            # Preserve the user's existing Hermes config.yaml across restarts.
+            # Rewriting it here drops channel/model settings (including Telegram).
+            # Setup saves remain responsible for explicit initial configuration.
+            config_path = Path(HERMES_HOME) / "config.yaml"
+            if not config_path.exists():
+                write_config_yaml(read_env(ENV_FILE))
             self.proc = await asyncio.create_subprocess_exec(
                 "hermes", "gateway",
                 stdout=asyncio.subprocess.PIPE,
@@ -768,8 +772,10 @@ async def route_telegram(request: Request) -> Response:
             status_code=upstream.status_code,
             media_type=upstream.headers.get("content-type"),
         )
-    except httpx.RequestError:
+    except (httpx.RequestError, httpx.TimeoutException):
+        # Non-2xx tells Telegram to retry rather than silently drop a message.
         return Response("Gateway unavailable", status_code=503)
+
 
 async def page_index(request: Request):
     if err := guard(request): return err
@@ -1300,7 +1306,7 @@ async def lifespan(app):
 ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 
 routes = [
-Route("/telegram", route_telegram, methods=["POST"]),
+    Route("/telegram", route_telegram, methods=["POST"]),
     # Public — no auth required.
     Route("/health",                            route_health),
     Route("/login",                             page_login,          methods=["GET"]),
