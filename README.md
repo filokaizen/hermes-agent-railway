@@ -143,6 +143,47 @@ Railway Container
 
 The admin server runs on `$PORT` and manages the Hermes gateway as a child process. Config is stored in `/data/.hermes/.env` and `/data/.hermes/config.yaml`. Gateway stdout/stderr is captured into a ring buffer and streamed to the Logs panel.
 
+
+## Telegram webhook + Railway Serverless (experimental)
+
+This fork exposes a **POST-only** `/telegram` route on the existing public
+Starlette server (`PORT=8080`), which forwards to Hermes's *internal*
+Telegram webhook listener on `127.0.0.1:8443`. It is not the Railway
+project-event webhook feature.
+
+**Before enabling:** keep the existing Railway service and persistent
+`/data` volume, back up `/data/.hermes` securely, and verify polling works
+with Serverless disabled. Do not run a second gateway with the same bot.
+
+Set these environment variables in Railway (never commit secrets):
+
+```text
+TELEGRAM_WEBHOOK_URL=https://YOUR-DOMAIN.up.railway.app/telegram
+TELEGRAM_WEBHOOK_PORT=8443
+TELEGRAM_WEBHOOK_SECRET=YOUR_RANDOM_SECRET
+```
+
+`TELEGRAM_BOT_TOKEN` must remain configured in the Hermes admin UI
+(or in `/data/.hermes/.env`). The public Target Port **stays at 8080**.
+Ensure Hermes has started the gateway and its logs report
+`Connected to Telegram (webhook mode)`. Verify Telegram's
+`getWebhookInfo` shows the correct URL and no delivery errors before
+enabling Railway **Sleep on Idle**. The proxy checks
+`X-Telegram-Bot-Api-Secret-Token` and forwards that header to Hermes;
+requests with no or wrong secret are denied.
+
+Test messages with the service awake first. Then enable Sleep on Idle,
+redeploy, close the dashboard, wait until Railway shows *Sleeping*, send a
+new message, and confirm both wake-up and delivery. Hermes tasks, background
+network activity, or dashboard connections may prevent sleeping; the first
+message after sleeping can be delayed or retried. This reduces running
+resource usage but does **not** guarantee a $5/month total bill.
+
+**Rollback:** disable Serverless; remove the three webhook environment
+variables (from Railway **and** any persisted `.env` overrides); restart
+the gateway so Telegram returns to polling mode. If necessary deploy the
+original `main` branch. Do **not** delete the persistent volume.
+
 ## Running Locally
 
 ```bash
