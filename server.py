@@ -478,8 +478,12 @@ class Gateway:
             model = env.get("LLM_MODEL", "")
             provider_key = next((env.get(k, "") for k in PROVIDER_KEYS if env.get(k)), "")
             print(f"[gateway] model={model or '⚠ NOT SET'} | provider_key={'set' if provider_key else '⚠ NOT SET'}", flush=True)
-            # Write config.yaml so hermes picks up the model (env vars alone aren't always enough)
-            write_config_yaml(read_env(ENV_FILE))
+            # Preserve the user's existing Hermes config.yaml across restarts.
+            # Rewriting it here drops channel/model settings (including Telegram).
+            # Setup saves remain responsible for explicit initial configuration.
+            config_path = Path(HERMES_HOME) / "config.yaml"
+            if not config_path.exists():
+                write_config_yaml(read_env(ENV_FILE))
             self.proc = await asyncio.create_subprocess_exec(
                 "hermes", "gateway",
                 stdout=asyncio.subprocess.PIPE,
@@ -716,6 +720,63 @@ def get_http_client() -> httpx.AsyncClient:
 
 
 # ── Route handlers ────────────────────────────────────────────────────────────
+
+async def route_telegram(request: Request) -> Response:
+    """Proxy seguro del webhook de Telegram hacia Hermes."""
+    import hmac
+
+    env_vars = read_env(ENV_FILE)
+    secret = env_vars.get(
+        "TELEGRAM_WEBHOOK_SECRET"
+    ) or os.environ.get("TELEGRAM_WEBHOOK_SECRET", "")
+
+    if not secret:
+        return Response("Webhook unavailable", status_code=503)
+
+    received = request.headers.get(
+        "X-Telegram-Bot-Api-Secret-Token", ""
+    )
+    if not hmac.compare_digest(received, secret):
+        return Response("Forbidden", status_code=403)
+
+    if request.headers.get("content-length", "").isdigit():
+        if int(request.headers["content-length"]) > 1048576:
+            return Response("Payload too large", status_code=413)
+
+    body = await request.body()
+    if len(body) > 1048576:
+        return Response("Payload too large", status_code=413)
+
+    port = int(
+        env_vars.get("TELEGRAM_WEBHOOK_PORT")
+        or os.environ.get("TELEGRAM_WEBHOOK_PORT", "8443")
+    )
+
+    try:
+        async with httpx.AsyncClient(
+            timeout=httpx.Timeout(60.0, connect=5.0),
+            trust_env=False,
+        ) as client:
+            upstream = await client.post(
+                f"http://127.0.0.1:{port}/telegram",
+                content=body,
+                headers={
+                    "Content-Type": request.headers.get(
+                        "content-type", "application/json"
+                    ),
+                    "X-Telegram-Bot-Api-Secret-Token": received,
+                },
+            )
+        return Response(
+            content=upstream.content,
+            status_code=upstream.status_code,
+            media_type=upstream.headers.get("content-type"),
+        )
+    except (httpx.RequestError, httpx.TimeoutException):
+        # Non-2xx tells Telegram to retry rather than silently drop a message.
+        return Response("Gateway unavailable", status_code=503)
+
+
 async def page_index(request: Request):
     if err := guard(request): return err
     return templates.TemplateResponse(request, "index.html")
@@ -1245,6 +1306,7 @@ async def lifespan(app):
 ANY_METHOD = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
 
 routes = [
+    Route("/telegram", route_telegram, methods=["POST"]),
     # Public — no auth required.
     Route("/health",                            route_health),
     Route("/login",                             page_login,          methods=["GET"]),
